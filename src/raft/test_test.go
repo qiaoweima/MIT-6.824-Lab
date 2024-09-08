@@ -60,17 +60,20 @@ func TestReElection2A(t *testing.T) {
 	leader1 := cfg.checkOneLeader()
 
 	// if the leader disconnects, a new one should be elected.
+	fmt.Printf("disconnect S%d\n", leader1)
 	cfg.disconnect(leader1)
 	cfg.checkOneLeader()
 
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader. and the old leader
 	// should switch to follower.
+	fmt.Printf("rejoin")
 	cfg.connect(leader1)
 	leader2 := cfg.checkOneLeader()
 
 	// if there's no quorum, no new leader should
 	// be elected.
+	fmt.Printf("no quorum")
 	cfg.disconnect(leader2)
 	cfg.disconnect((leader2 + 1) % servers)
 	time.Sleep(2 * RaftElectionTimeout)
@@ -80,6 +83,7 @@ func TestReElection2A(t *testing.T) {
 	cfg.checkNoLeader()
 
 	// if a quorum arises, it should elect a leader.
+	fmt.Printf("rejoin quorum")
 	cfg.connect((leader2 + 1) % servers)
 	cfg.checkOneLeader()
 
@@ -285,6 +289,8 @@ func TestFailAgree2B(t *testing.T) {
 
 	// disconnect one follower from the network.
 	leader := cfg.checkOneLeader()
+	i := (leader + 1) % servers
+	fmt.Printf("disconnect one follower %d from leader %d\n", i, leader)
 	cfg.disconnect((leader + 1) % servers)
 
 	// the leader and remaining follower should be
@@ -296,11 +302,13 @@ func TestFailAgree2B(t *testing.T) {
 	cfg.one(105, servers-1, false)
 
 	// re-connect
+	fmt.Printf("reconnect %d\n", i)
 	cfg.connect((leader + 1) % servers)
 
 	// the full set of servers should preserve
 	// previous agreements, and be able to agree
 	// on new commands.
+	fmt.Printf("new commands\n")
 	cfg.one(106, servers, true)
 	time.Sleep(RaftElectionTimeout)
 	cfg.one(107, servers, true)
@@ -471,6 +479,7 @@ func TestRejoin2B(t *testing.T) {
 
 	// leader network failure
 	leader1 := cfg.checkOneLeader()
+	fmt.Printf("leader1 disconnect S%d\n", leader1)
 	cfg.disconnect(leader1)
 
 	// make old leader try to agree on some entries
@@ -486,11 +495,13 @@ func TestRejoin2B(t *testing.T) {
 	cfg.disconnect(leader2)
 
 	// old leader connected again
+	fmt.Printf("leader1 reconnect S%d\n", leader1)
 	cfg.connect(leader1)
 
 	cfg.one(104, 2, true)
 
 	// all together now
+	fmt.Printf("leader2 reconnect S%d\n", leader2)
 	cfg.connect(leader2)
 
 	cfg.one(105, servers, true)
