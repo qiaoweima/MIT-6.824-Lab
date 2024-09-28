@@ -37,6 +37,7 @@ const (
 	dWarn logTopic = "WARN"
 	dError logTopic = "ERROR"
 	dFatal logTopic = "FATAL"
+	dSnapshot logTopic = "SNAP"
 )
 
 var debugStart time.Time
