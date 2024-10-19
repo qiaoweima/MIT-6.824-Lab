@@ -10,9 +10,11 @@ package shardkv
 
 import "6.824/labrpc"
 import "crypto/rand"
+import rand2 "math/rand"
 import "math/big"
 import "6.824/shardctrler"
 import "time"
+import "sync/atomic"
 
 //
 // which shard is a key in?

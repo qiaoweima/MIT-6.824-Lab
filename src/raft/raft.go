@@ -197,6 +197,9 @@ func (rf *Raft) serializeState() []byte {
 	return w.Bytes()
 }
 
+func (rf *Raft) GetStateSize() int {
+	return rf.persister.RaftStateSize()
+}
 //
 // restore previously persisted state.
 //
@@ -269,12 +272,12 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	defer rf.mu.Unlock()
 	rf.Debug(dSnapshot, "CondInstallSnapshot lastIncludedTerm=%d lastIncludeIndex=%d %s", lastIncludedTerm, lastIncludedIndex, rf.FormatStateOnly())
 
-	if lastIncludedIndex <= rf.commitIndex {
+	if lastIncludedIndex < rf.commitIndex {
 		rf.Debug(dSnapshot, "rejected outdated CondInstallSnapshot")
 		return false
 	}
 
-	rf.Debug(dSnapshot, "before install snapshot: %s full log: %v", rf.FormatStateOnly(), rf.log)
+	rf.Debug(dSnapshot, "before install snapshot: %s full log: %v", rf.FormatStateOnly(), rf.FormatFullLog())
 	if lastIncludedIndex >= rf.LogTail().Index {
 		rf.log = rf.log[0:1]
 	} else {
@@ -285,7 +288,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	rf.log[0].Command = nil
 	rf.commitIndex = lastIncludedIndex
 	rf.lastApplied = lastIncludedIndex
-	rf.Debug(dSnapshot, "after install snapshot: %s full log: %v", rf.FormatStateOnly(), rf.log)
+	rf.Debug(dSnapshot, "after install snapshot: %s full log: %v", rf.FormatStateOnly(), rf.FormatFullLog())
 	rf.persister.SaveStateAndSnapshot(rf.serializeState(), snapshot)
 
 	return true
@@ -302,11 +305,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.Debug(dSnapshot, "snapshot until %d", index)
 	for _, entry := range rf.log {
 		if entry.Index == index {
-			rf.Debug(dSnapshot, "before snapshot: full log: %v", rf.log)
+			rf.Debug(dSnapshot, "before snapshot: full log: %v", rf.FormatFullLog())
 			rf.log = rf.log[rf.LogIndexToSubscript(entry.Index):]
 			rf.log[0].Command = nil
-			rf.Debug(dSnapshot, "after snapshot: full log: %s", rf.log)
+			rf.Debug(dSnapshot, "after snapshot: full log: %s", rf.FormatFullLog())
 			rf.persister.SaveStateAndSnapshot(rf.serializeState(), snapshot)
+			return
 		}
 	}
 
@@ -336,9 +340,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.becomeFollower()
 		rf.resetTerm(args.Term)
 	}
-	if args.PrevLogIndex > 0 {
+	if args.PrevLogIndex > 0  && args.PrevLogIndex >= rf.log[0].Index {
 		if prev := rf.GetLogAtIndex(args.PrevLogIndex); prev == nil || prev.Term != args.PrevLogTerm {
-			rf.Debug(dLog, "log consistency check failed. local log at prev {%d t%d}; %+v full log: %v", args.PrevLogIndex, args.PrevLogTerm, prev, rf.log)
+			rf.Debug(dLog, "log consistency check failed. local log at prev {%d t%d}; %+v full log: %v", args.PrevLogIndex, args.PrevLogTerm, prev, rf.FormatFullLog())
 			if prev != nil {
 				for _, entry := range rf.log {
 					if entry.Term == prev.Term {
@@ -357,24 +361,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if len(args.Entries) > 0 {
 		rf.Debug(dLog, "before merge: %s", rf.FormatLog())
-		appendLeft := 0
-		for i, entry := range args.Entries {
-			if local := rf.GetLogAtIndex(entry.Index); local != nil {
-				if local.Index != entry.Index {
-					panic(rf.Sdebug(dFatal, "LMP violated: local.Index != entry.Index, entry: %+v local log at entry.Index: %+v", entry, local))
+		if LogTail(args.Entries).Index >= rf.log[0].Index {
+			appendLeft := 0
+			for i, entry := range args.Entries {
+				if local := rf.GetLogAtIndex(entry.Index); local != nil {
+					if local.Index != entry.Index {
+						panic(rf.Sdebug(dFatal, "LMP violated: local.Index != entry.Index. entry: %+v local log at entry.Index: %+v", entry, local))
+					}
+					if local.Term != entry.Term {
+						rf.Debug(dLog, "merge conflict at %d", i)
+						rf.log = rf.log[:rf.LogIndexToSubscript(entry.Index)]
+						appendLeft = i
+						break
+					}
+					appendLeft = i + 1
 				}
-				if local.Term != entry.Term {
-					rf.Debug(dLog, "merge conflict at %d", i)
-					rf.log = rf.log[:rf.LogIndexToSubscript(entry.Index)]
-					appendLeft = i
-					break;
-				}
-				appendLeft = i + 1
 			}
-		}
-		for i := appendLeft; i < len(args.Entries); i++ {
-			entry := *args.Entries[i]
-			rf.log = append(rf.log, &entry)
+			for i := appendLeft; i < len(args.Entries); i++ {
+				entry := *args.Entries[i]
+				rf.log = append(rf.log, &entry)
+			}
 		}
 		rf.Debug(dLog, "after merge: %s", rf.FormatLog())
 		rf.persist()
@@ -471,7 +477,7 @@ func (rf *Raft) isAtLeastUpToDate(args *RequestVoteArgs) bool {
 		b = args.LastLogTerm >= rf.LogTail().Term
 	}
 	if !b {
-		rf.Debug(dVote, "hands down RequestVote from S%d %+v current log: %s", args.CandidateId, args, rf.log)
+		rf.Debug(dVote, "hands down RequestVote from S%d %+v current log: %s", args.CandidateId, args, rf.FormatFullLog())
 	}
 	return b
 }
@@ -512,8 +518,8 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 const (
 	ElectionTimeoutMax = int64(600 * time.Millisecond)
-	ElectionTimeoutMin = int64(400 * time.Millisecond)
-	HeartbeatInterval = 100 * time.Millisecond
+	ElectionTimeoutMin = int64(500 * time.Millisecond)
+	HeartbeatInterval = 20 * time.Millisecond
 )
 
 type InstallSnapshotArgs struct {
@@ -629,8 +635,8 @@ func (rf *Raft) DoElection() {
 							}
 							rf.matchIndex[rf.me] = rf.LogTail().Index
 							rf.Debug(dLeader, "majority vote (%d/%d) received, turning Leader", vote, len(rf.peers))
-							rf.BroadcastHeartbeat()
 							rf.becomeLeader()
+							rf.BroadcastHeartbeat()
 						}
 					}
 				}(i, args)
@@ -674,6 +680,10 @@ func (rf *Raft) needHeartbeat() bool {
 	return rf.state == Leader
 }
 
+func (rf *Raft) needApplyL() bool {
+	return rf.commitIndex > rf.lastApplied
+}
+
 func (rf *Raft) DoApply(apply chan ApplyMsg) {
 	rf.applyCond.L.Lock()
 	defer rf.applyCond.L.Unlock()
@@ -685,6 +695,10 @@ func (rf *Raft) DoApply(apply chan ApplyMsg) {
 			}
 		}
 		rf.mu.Lock()
+		if !rf.needApplyL() {
+			rf.mu.Unlock()
+			continue
+		}
 		rf.lastApplied += 1
 		entry := rf.GetLogAtIndex(rf.lastApplied)
 		if entry == nil {
@@ -706,7 +720,7 @@ func (rf *Raft) needApply() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.Debug(dTrace, "needApply: commitIndex=%d lastApplied=%d", rf.commitIndex, rf.lastApplied)
-	return rf.commitIndex > rf.lastApplied
+	return rf.needApplyL()
 }
 
 func (rf *Raft) DoReplicate(peer int) {
@@ -818,7 +832,7 @@ func (rf *Raft) Sync(peer int, args *AppendEntriesArgs) {
 			logTailIndex := LogTail(args.Entries).Index
 			rf.matchIndex[peer] = logTailIndex
 			rf.nextIndex[peer] = logTailIndex + 1
-			rf.Debug(dHeartbeat, "S%d logTailIndex=%d commitIndex=%d matchIndex=%v nextIndex=%v", peer, logTailIndex, rf.commitIndex, rf.matchIndex, rf.nextIndex)
+			rf.Debug(dHeartbeat, "S%d logTailIndex=%d commitIndex=%d lastApplied=%d matchIndex=%v nextIndex=%v", peer, logTailIndex, rf.commitIndex, rf.lastApplied, rf.matchIndex, rf.nextIndex)
 			// update commitIndex
 			preCommitIndex := rf.commitIndex
 			for i := rf.commitIndex; i <= logTailIndex; i++ {
@@ -848,13 +862,13 @@ func (rf *Raft) Sync(peer int, args *AppendEntriesArgs) {
 				for i := len(rf.log) - 1; i >= 1; i-- {
 					if rf.log[i].Term == reply.ConflictingTerm {
 						rf.nextIndex[peer] = Min(nextIndex, rf.log[i].Index + 1)
-						rf.Debug(dHeartbeat, "S%d old_nextIndex: %d new_nextIndex: %d full log: %s", peer, nextIndex, rf.nextIndex[peer], rf.FormatLog())
+						rf.Debug(dHeartbeat, "S%d old_nextIndex: %d new_nextIndex: %d full log: %s", peer, nextIndex, rf.nextIndex[peer], rf.FormatFullLog())
 						return
 					}
 				}
 			}
 			rf.nextIndex[peer] = Max(Min(nextIndex, reply.ConflictingIndex), 1)
-			rf.Debug(dHeartbeat, "S%d old_nextIndex: %d new_nextIndex: %d full log: %s", peer, nextIndex, rf.nextIndex[peer], rf.FormatLog())
+			rf.Debug(dHeartbeat, "S%d old_nextIndex: %d new_nextIndex: %d full log: %s", peer, nextIndex, rf.nextIndex[peer], rf.FormatFullLog())
 		}
 	}
 } 
@@ -895,9 +909,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.persist()
 	rf.matchIndex[rf.me] += 1
 	rf.Debug(dClient, "client start replication with entry %v %s", entry, rf.FormatState())
-	for i := range rf.peers  {
-		rf.replicateCond[i].Broadcast()
-	}
 	return entry.Index, rf.term, rf.state == Leader
 }
 
